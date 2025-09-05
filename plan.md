@@ -25,24 +25,33 @@ How do the model's own responses influence its representations of Crescendo inpu
 
 ## Implementation Plan
 
-### Phase 1: Crescendo Attack Validation (Weeks 1-2)
+### Phase 1: Crescendo Attack Validation (Weeks 1-2) ✅ COMPLETED
 
 #### 1.1 Manual Testing
-- [ ] Extract examples from Appendix D of the reference paper
-- [ ] Test manual Crescendo examples on DeepSeek-R1-Distill-Qwen-1.5B
-- [ ] Document attack success rates and model responses
-- [ ] Analyze reasoning traces for evidence of jailbreak detection/mitigation
+- [x] Extract examples from Appendix D of the reference paper
+- [x] Test manual Crescendo examples on DeepSeek-R1-Distill-Qwen-1.5B
+- [x] Document attack success rates and model responses
+- [x] Analyze reasoning traces for evidence of jailbreak detection/mitigation
 
 #### 1.2 Automated Pipeline Development
-- [ ] Implement automated Crescendo attack generation
-- [ ] Create evaluation metrics for attack success
-- [ ] Generate diverse attack scenarios across different harmful categories
-- [ ] Build dataset of successful/failed attack sequences
+- [x] Implement automated Crescendo attack generation
+- [x] Create evaluation metrics for attack success
+- [x] Generate diverse attack scenarios across different harmful categories
+- [x] Build dataset of successful/failed attack sequences
 
-**Deliverables**: 
-- Attack success rate analysis
-- Dataset of Crescendo conversations with labels
-- Documentation of reasoning model behavior differences
+#### 1.3 Infrastructure Improvements ✅ COMPLETED
+- [x] Implement sliding window context management (k-parameter from paper)
+- [x] Fix DeepSeek-R1 chat template formatting to prevent role tag generation
+- [x] Add proper token counting and context limit management
+- [x] Enhance reasoning trace extraction for `<think>` tags
+- [x] Implement interactive and batch testing modes
+
+**Deliverables**: ✅ COMPLETED
+- [x] Attack success rate analysis
+- [x] Dataset of Crescendo conversations with labels (JSON/CSV outputs)
+- [x] Documentation of reasoning model behavior differences
+- [x] Robust sliding window conversation management system
+- [x] Proper DeepSeek-R1 chat template integration
 
 ### Phase 2: Representation Analysis (Weeks 3-5)
 
@@ -153,10 +162,12 @@ How do the model's own responses influence its representations of Crescendo inpu
 
 ## Timeline and Milestones
 
-### Week 1-2: Foundation
-- [ ] Environment setup and model access
-- [ ] Manual attack validation
-- [ ] Initial data collection pipeline
+### Week 1-2: Foundation ✅ COMPLETED
+- [x] Environment setup and model access
+- [x] Manual attack validation
+- [x] Initial data collection pipeline
+- [x] Sliding window context management implementation
+- [x] Chat template formatting fixes
 
 ### Week 3-4: Core Analysis
 - [ ] Representation extraction system
@@ -198,7 +209,7 @@ How do the model's own responses influence its representations of Crescendo inpu
 ## Success Criteria
 
 ### Minimum Viable Results
-- [ ] Successful replication of Crescendo attacks on reasoning model
+- [x] Successful replication of Crescendo attacks on reasoning model
 - [ ] Functional representation reading pipeline
 - [ ] Clear answers to RQ1, RQ2, and RQ3
 - [ ] Basic steering implementation
