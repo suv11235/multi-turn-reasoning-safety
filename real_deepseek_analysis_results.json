@@ -1,0 +1,14 @@
+{
+  "timestamp": "2025-09-08T10:01:18.642384",
+  "dataset_summary": {
+    "total_representations": 10,
+    "harmful_count": 5,
+    "benign_count": 5,
+    "feature_dimension": 1536
+  },
+  "statistical_analysis": {
+    "mean_distance": 43.13016128540039,
+    "harmful_magnitude": 372.70660400390625,
+    "benign_magnitude": 398.68206787109375
+  }
+}
