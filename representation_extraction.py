@@ -120,6 +120,43 @@ class RepresentationExtractor:
         
         self.logger.info(f"Initialized extractor for layers: {self.target_layers}")
     
+    def _build_conversation_context(self, conversation_turns: List[Tuple[str, str]], current_question: str, k: int = 3) -> str:
+        """
+        Build conversation context using sliding window approach.
+        Adapted from MultiTurnJailbreakTester to avoid creating new instances.
+        
+        Args:
+            conversation_turns: List of (user_question, assistant_response) pairs
+            current_question: The current user question to add
+            k: Number of recent turns to include
+            
+        Returns:
+            Formatted conversation context
+        """
+        # Select the k most recent conversation turns
+        if len(conversation_turns) <= k:
+            recent_turns = conversation_turns
+        else:
+            recent_turns = conversation_turns[-k:]
+            
+        # Build messages list for chat template
+        messages = []
+        for user_msg, assistant_msg in recent_turns:
+            messages.append({"role": "user", "content": user_msg})
+            messages.append({"role": "assistant", "content": assistant_msg})
+        
+        # Add the current user question
+        messages.append({"role": "user", "content": current_question})
+        
+        # Format using the model's chat template
+        context = self.tokenizer.apply_chat_template(
+            messages, 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+        
+        return context
+    
     def _create_hook_fn(self, layer_name: str) -> Callable:
         """Create a hook function for capturing activations."""
         def hook_fn(module, input, output):
@@ -190,9 +227,8 @@ class RepresentationExtractor:
                 # Build conversation context up to this turn
                 context_turns = conversation_turns[:turn_idx]
                 
-                # Use the same context building logic as the main pipeline
-                tester = MultiTurnJailbreakTester(self.model_name)
-                conversation_text = tester.build_conversation_context(context_turns, user_input)
+                # Build conversation context directly without creating new tester
+                conversation_text = self._build_conversation_context(context_turns, user_input)
                 
                 # Tokenize
                 inputs = self.tokenizer(
@@ -247,14 +283,22 @@ class RepresentationExtractor:
         
         return conversation_reps
     
-    def extract_from_attack_results(self, attack_results: List[AttackResult]) -> None:
+    def extract_from_attack_results(self, attack_results: List[AttackResult], max_results: Optional[int] = None) -> None:
         """Extract representations from a list of attack results."""
+        # Limit results if specified for memory management
+        if max_results is not None:
+            attack_results = attack_results[:max_results]
+            
         self.logger.info(f"Extracting representations from {len(attack_results)} attack results")
         
         for i, result in enumerate(attack_results):
             self.logger.info(f"Processing attack result {i+1}/{len(attack_results)}: {result.template_id}")
             
             try:
+                # Clear any cached data to free memory
+                if hasattr(torch.cuda, 'empty_cache'):
+                    torch.cuda.empty_cache()
+                
                 conversation_reps = self.extract_representations_from_conversation(
                     conversation_turns=result.conversation_turns,
                     conversation_id=result.template_id,
@@ -268,6 +312,8 @@ class RepresentationExtractor:
                 
             except Exception as e:
                 self.logger.error(f"Failed to extract representations from {result.template_id}: {e}")
+                # Continue with next result instead of failing completely
+                continue
     
     def extract_benign_baseline(self, num_conversations: int = 10, turns_per_conversation: int = 5) -> None:
         """Generate and extract representations from benign conversations."""
@@ -280,8 +326,6 @@ class RepresentationExtractor:
             "exercise routines", "gardening tips", "music theory",
             "programming concepts"
         ]
-        
-        tester = MultiTurnJailbreakTester(self.model_name)
         
         for conv_idx in range(num_conversations):
             topic = benign_topics[conv_idx % len(benign_topics)]
@@ -304,11 +348,30 @@ class RepresentationExtractor:
                     ]
                     user_input = follow_ups[turn % len(follow_ups)]
                 
-                # Get model response
-                response = tester.generate_response(
-                    tester.build_conversation_context(conversation_turns, user_input)
-                )
-                reasoning_trace = tester.extract_reasoning_trace(response)
+                # Get model response using our own model instance
+                conversation_context = self._build_conversation_context(conversation_turns, user_input)
+                inputs = self.tokenizer(
+                    conversation_context,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=8192,
+                    padding=True
+                ).to(self.device)
+                
+                # Generate response
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        **inputs,
+                        max_new_tokens=512,
+                        temperature=0.7,
+                        do_sample=True,
+                        pad_token_id=self.tokenizer.pad_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id
+                    )
+                
+                # Decode response
+                response_tokens = outputs[0][inputs['input_ids'].shape[1]:]
+                response = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
                 
                 conversation_turns.append((user_input, response))
             
@@ -583,6 +646,8 @@ def main():
     parser.add_argument("--target-layers", nargs="+", help="Specific layers to target")
     parser.add_argument("--benign-conversations", type=int, default=10,
                        help="Number of benign conversations to generate")
+    parser.add_argument("--max-attack-results", type=int, default=None,
+                       help="Maximum number of attack results to process (for memory management)")
     
     args = parser.parse_args()
     
@@ -631,7 +696,7 @@ def main():
                 attack_results.append(result)
             
             # Extract representations
-            extractor.extract_from_attack_results(attack_results)
+            extractor.extract_from_attack_results(attack_results, max_results=args.max_attack_results)
         
         else:
             # Generate new attack results using the automated pipeline
@@ -640,7 +705,7 @@ def main():
             attack_results = pipeline.run_comprehensive_evaluation()
             
             # Extract representations
-            extractor.extract_from_attack_results(attack_results)
+            extractor.extract_from_attack_results(attack_results, max_results=args.max_attack_results)
         
         # Save extracted representations
         output_file = extractor.save_representations()
