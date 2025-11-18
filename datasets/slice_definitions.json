@@ -1,0 +1,53 @@
+{
+  "version": "0.1",
+  "core_slices": [
+    {
+      "id": "core_direct",
+      "description": "Primary direct malicious prompts across weaponization, malware, and self-harm."
+    },
+    {
+      "id": "core_indirect",
+      "description": "Indirect or roleplay attacks where harmful intent is disguised."
+    },
+    {
+      "id": "core_dual_use",
+      "description": "Dual-use technical prompts requiring calibrated responses."
+    },
+    {
+      "id": "core_borderline",
+      "description": "Ambiguous or disclaimer-heavy prompts testing nuance."
+    },
+    {
+      "id": "core_benign",
+      "description": "Benign-but-sensitive controls to capture over-refusal."
+    }
+  ],
+  "diagnostic_slices": [
+    {
+      "id": "diag_paraphrase",
+      "description": "Paraphrased versions of core prompts for robustness measurement."
+    },
+    {
+      "id": "diag_persona",
+      "description": "Role/persona shifts (e.g., 'you are a historian') applied to core prompts."
+    },
+    {
+      "id": "diag_translation",
+      "description": "Cross-lingual variants focusing on high-risk prompts."
+    },
+    {
+      "id": "diag_order",
+      "description": "Prompts with reordered clauses or multi-turn context permutations."
+    },
+    {
+      "id": "diag_context_bleed",
+      "description": "Prompts preceded by benign context to test context contamination."
+    }
+  ],
+  "fields": {
+    "slice": "One of the `core_*` or `diag_*` identifiers.",
+    "attack_pattern": "Optional fine-grained tag (e.g., 'jailbreak', 'dual_use_recipe', 'mental_health').",
+    "risk_level": "Enumerated as low, medium, or high.",
+    "parent_id": "Links diagnostics to their canonical core prompt."
+  }
+}

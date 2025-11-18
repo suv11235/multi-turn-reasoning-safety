@@ -1,0 +1,31 @@
+{
+  "version": "0.2",
+  "last_updated": "2025-11-16",
+  "attack_patterns": {
+    "child_abuse": [
+      "child_grooming", "research_disguise", "profile_forgery", "sextortion_script",
+      "grooming_bribes", "surveillance_abuse", "journalism_disguise", "age_bypass",
+      "emotional_manipulation", "academic_study", "vulnerability_assessment"
+    ],
+    "firearms": [
+      "firearm_modification", "firearm_legal_loophole", "ammunition_production",
+      "disguised_weapon", "security_evasion", "detection_avoidance", "professional_analysis",
+      "historical_adaptation", "academic_weaponization", "legal_reinstatement",
+      "forensic_avoidance", "financial_obfuscation", "physical_obfuscation"
+    ],
+    "bioweapons": [
+      "bioweapon_synthesis", "gain_of_function", "pathogen_culturing", "delivery_optimization",
+      "toxin_stabilization", "computational_modeling", "weaponization_traits", "media_disguise",
+      "academic_optimization", "epidemiological_modeling", "low_tech_purification"
+    ],
+    "meta": [
+      "policy_explanation", "safety_education", "child_safety", "legal_citation"
+    ]
+  },
+  "categories": [
+    {"id": "direct_harm", "description": "Unambiguous harmful instructions"},
+    {"id": "indirect_harm", "description": "Disguised or research-framed harmful requests"},
+    {"id": "dual_use", "description": "Legitimate queries with weaponization potential"},
+    {"id": "perturbation", "description": "Diagnostic variants of core prompts"}
+  ]
+}
