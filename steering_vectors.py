@@ -1,110 +1,163 @@
-import os
-from typing import Dict, List, Tuple, Any
-
-import numpy as np
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-#from nnsight import LanguageModel
+import numpy as np
+import logging
+from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass
+
+# Import RepresentationData from the extraction module
+# Assuming it's available in the python path or same directory
+from representation_extraction import RepresentationData
+
+class SteeringVectorGenerator:
+    """Generates steering vectors from extracted representations."""
+    
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+
+    def compute_vector(self, harmful_reps: List[RepresentationData], 
+                      benign_reps: List[RepresentationData],
+                      layer_name: str) -> Optional[torch.Tensor]:
+        """
+        Compute steering vector as Mean(Harmful) - Mean(Benign).
+        returns a tensor of shape [hidden_dim]
+        """
+        if not harmful_reps or not benign_reps:
+            self.logger.warning(f"Insufficient data for layer {layer_name}")
+            return None
+
+        # Helper to get flat features
+        def get_features(reps):
+            features = []
+            for r in reps:
+                if r.layer_name != layer_name:
+                    continue
+                # Average over sequence length (and batch if present)
+                # rep.representation is numpy array
+                if len(r.representation.shape) == 3:
+                    feat = np.mean(r.representation, axis=(0, 1))
+                elif len(r.representation.shape) == 2:
+                    feat = np.mean(r.representation, axis=0)
+                else:
+                    feat = r.representation
+                features.append(feat)
+            return features
+
+        harmful_feats = get_features(harmful_reps)
+        benign_feats = get_features(benign_reps)
+
+        if not harmful_feats or not benign_feats:
+            return None
+
+        # Compute means
+        mu_harmful = np.mean(np.stack(harmful_feats), axis=0)
+        mu_benign = np.mean(np.stack(benign_feats), axis=0)
+
+        # Steering vector: direction away from harmful
+        # Or direction towards safety: Benign - Harmful
+        # Usually "Circuit Breaker" subtracts the harmful concept.
+        # So Vector = Mu_Harmful - Mu_Benign
+        # Then we SUBTRACT this vector * alpha.
+        steering_vector = mu_harmful - mu_benign
+        
+        return torch.tensor(steering_vector, dtype=torch.float32)
+
+    def compute_all_layers(self, harmful_reps: List[RepresentationData],
+                          benign_reps: List[RepresentationData]) -> Dict[str, torch.Tensor]:
+        """Compute vectors for all available layers."""
+        layers = set(r.layer_name for r in harmful_reps) | set(r.layer_name for r in benign_reps)
+        vectors = {}
+        
+        for layer in layers:
+            vec = self.compute_vector(harmful_reps, benign_reps, layer)
+            if vec is not None:
+                vectors[layer] = vec
+                
+        return vectors
 
 
-def load_model_and_vectors(model_name: str, model=None, compute_features=True, normalize_features=True) -> Dict[str, torch.Tensor]:
+class CircuitBreaker:
+    """Applies steering vectors to interrupt harmful processing."""
 
-    # Get model identifier for file naming
-    model_id = model_name.split('/')[-1].lower()
-    # go into directory of this file
-    vector_path = f"../train-steering-vectors/results/vars/mean_vectors_{model_id}.pt"
-    if os.path.exists(vector_path):
-        mean_vectors_dict = torch.load(vector_path)
+    def __init__(self, model: torch.nn.Module, 
+                 steering_vectors: Dict[str, torch.Tensor],
+                 alpha: float = 1.0):
+        self.model = model
+        self.vectors = steering_vectors
+        self.alpha = alpha
+        self.hooks = []
+        self.logger = logging.getLogger(__name__)
+        self.device = next(model.parameters()).device
 
-        if compute_features:
-            # Compute feature vectors by subtracting overall mean
-            feature_vectors = {}
-            feature_vectors["overall"] = mean_vectors_dict["overall"]['mean']
-
-            for label in ["initializing", "deduction", "adding-knowledge", "example-testing", "uncertainty-estimation", "backtracking"]:
-
-                if label != 'overall':
-                    feature_vectors[label] = mean_vectors_dict[label]['mean'] - mean_vectors_dict["overall"]['mean']
-
-                if normalize_features:
-                    for label in feature_vectors:
-                        for layer in range(model.config.num_hidden_layers):
-                            feature_vectors[label][layer] = feature_vectors[label][layer] * (feature_vectors["overall"][layer].norm() / feature_vectors[label][layer].norm())
-
-        return feature_vectors
-
-    else:
-        raise FileNotFoundError(f"Steering vectors not found at: {vector_path}")
-        mean_vectors_dict = {}
-        feature_vectors = {}
-        return feature_vectors
-
-def custom_generate_steering(model, tokenizer, input_ids, max_new_tokens, label, feature_vectors, steering_config, steer_positive=False):
-    """
-    Generate text while removing or adding projections of specific features.
-
-    Args:
-        model: The model to use for generation
-        tokenizer: The tokenizer
-        input_ids: Input token ids
-        max_new_tokens: Maximum number of tokens to generate
-        label: The label to steer towards/away from
-        feature_vectors: Dictionary of feature vectors containing steering_vector_set
-        steer_positive: If True, steer towards the label, if False steer away
-    """
-    model_layers = model.model.layers
-    print("custom_generate_steering")
-
-    with model.generate(
-        {
-            "input_ids": input_ids,
-            "attention_mask": (input_ids != tokenizer.pad_token_id).long()
-        },
-        max_new_tokens=max_new_tokens,
-        pad_token_id=tokenizer.pad_token_id,
-    ) as tracer:
-        # Apply .all() to model to ensure interventions work across all generations
-        model_layers.all()
-
-        if feature_vectors is not None:
-            vector_layer = steering_config[label]["vector_layer"]
-            pos_layers = steering_config[label]["pos_layers"]
-            neg_layers = steering_config[label]["neg_layers"]
-            coefficient = steering_config[label]["pos_coefficient"] if steer_positive else steering_config[label]["neg_coefficient"]
-
-
-            if steer_positive:
-                feature_vector = feature_vectors[label][vector_layer].to("cuda").to(torch.bfloat16)
-                for layer_idx in pos_layers:
-                    model.model.layers[layer_idx].output[0][:, :] += coefficient * feature_vector.unsqueeze(0).unsqueeze(0)
+    def _create_hook(self, vector: torch.Tensor):
+        # Move vector to correct device/dtype
+        vector = vector.to(self.device).to(self.model.dtype)
+        
+        def hook_fn(module, input, output):
+            # Output is usually (hidden_states, ...) tuple or just hidden_states
+            if isinstance(output, tuple):
+                hidden_states = output[0]
+                is_tuple = True
             else:
-                feature_vector = feature_vectors[label][vector_layer].to("cuda").to(torch.bfloat16)
-                for layer_idx in neg_layers:
-                    model.model.layers[layer_idx].output[0][:, :] -= coefficient * feature_vector.unsqueeze(0).unsqueeze(0)
+                hidden_states = output
+                is_tuple = False
+                
+            # Subtract steering vector
+            # hidden_states: [batch, seq, hidden]
+            # vector: [hidden]
+            # usage: hidden - alpha * vector
+            
+            # Subtraction happens in-place or returns new tensor
+            # Ensure broadcasting works
+            
+            perturbation = self.alpha * vector.view(1, 1, -1)
+            modified_hidden = hidden_states - perturbation
+            
+            if is_tuple:
+                return (modified_hidden,) + output[1:]
+            else:
+                return modified_hidden
+                
+        return hook_fn
 
-        outputs = model.generator.output.save()
+    def verify_compatibility(self):
+        """Check if target layers exist in model."""
+        for layer_name in self.vectors:
+            try:
+                # Try to access layer
+                parts = layer_name.split('.')
+                curr = self.model
+                for p in parts:
+                    curr = getattr(curr, p)
+            except AttributeError:
+                self.logger.warning(f"Layer {layer_name} not found in model")
 
-    return outputs
+    def register(self):
+        """Register all hooks."""
+        self.remove() # Clear existing
+        
+        for layer_name, vector in self.vectors.items():
+            try:
+                parts = layer_name.split('.')
+                curr = self.model
+                for p in parts:
+                    curr = getattr(curr, p)
+                
+                hook = curr.register_forward_hook(self._create_hook(vector))
+                self.hooks.append(hook)
+                self.logger.info(f"Circuit breaker registered on {layer_name}")
+            except Exception as e:
+                self.logger.error(f"Failed to register hook on {layer_name}: {e}")
 
+    def remove(self):
+        """Remove all hooks."""
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks = []
+        self.logger.info("Circuit breakers removed")
 
-steering_config = {
-    "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B": {
-        "backtracking": {"vector_layer": 17, "pos_layers": [17], "neg_layers": [17], "pos_coefficient": 1, "neg_coefficient": 1},
-        "uncertainty-estimation": {"vector_layer": 18, "pos_layers": [18], "neg_layers": [18], "pos_coefficient": 1, "neg_coefficient": 1},
-        "example-testing": {"vector_layer": 15, "pos_layers": [15], "neg_layers": [15], "pos_coefficient": 1, "neg_coefficient": 1},
-        "adding-knowledge": {"vector_layer": 18, "pos_layers": [18], "neg_layers": [18], "pos_coefficient": 1, "neg_coefficient": 1},
-    },
-    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B": {
-        "backtracking": {"vector_layer": 12, "pos_layers": [12], "neg_layers": [12], "pos_coefficient": 1, "neg_coefficient": 1},
-        "uncertainty-estimation": {"vector_layer": 12, "pos_layers": [12], "neg_layers": [12], "pos_coefficient": 1, "neg_coefficient": 1},
-        "example-testing": {"vector_layer": 12, "pos_layers": [12], "neg_layers": [12], "pos_coefficient": 1, "neg_coefficient": 1},
-        "adding-knowledge": {"vector_layer": 12, "pos_layers": [12], "neg_layers": [12], "pos_coefficient": 1, "neg_coefficient": 1},
-    },
-    "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B": {
-        "backtracking": {"vector_layer": 29, "pos_layers": [29], "neg_layers": [29], "pos_coefficient": 1, "neg_coefficient": 1},
-        "uncertainty-estimation": {"vector_layer": 29, "pos_layers": [29], "neg_layers": [29], "pos_coefficient": 1, "neg_coefficient": 1},
-        "example-testing": {"vector_layer": 29, "pos_layers": [29], "neg_layers": [29], "pos_coefficient": 1, "neg_coefficient": 1},
-        "adding-knowledge": {"vector_layer": 24, "pos_layers": [24], "neg_layers": [24], "pos_coefficient": 1, "neg_coefficient": 1},
-    }
+    def __enter__(self):
+        self.register()
+        return self
 
-}
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.remove()

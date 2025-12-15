@@ -93,7 +93,7 @@ class RepresentationExtractor:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
             device_map="auto" if torch.cuda.is_available() else None,
             trust_remote_code=True,
             output_attentions=True,  # Enable attention extraction
@@ -132,7 +132,7 @@ class RepresentationExtractor:
             
             # Convert to numpy and store
             if isinstance(hidden_states, torch.Tensor):
-                representation = hidden_states.detach().cpu().numpy()
+                representation = hidden_states.detach().cpu().float().numpy()
                 
                 # Store in current extraction context
                 if 'representations' not in self.current_extraction_context:
@@ -569,6 +569,205 @@ class RepresentationAnalyzer:
         }
         
         return results
+
+
+
+class DriftAnalyzer:
+    """Analyze representation drift and concept evolution."""
+    
+    def __init__(self, representations: List[RepresentationData]):
+        self.representations = representations
+        self.logger = logging.getLogger(__name__)
+        
+        # Organize by layer
+        self.layer_data = {}
+        for rep in representations:
+            if rep.layer_name not in self.layer_data:
+                self.layer_data[rep.layer_name] = []
+            self.layer_data[rep.layer_name].append(rep)
+            
+    def _get_features(self, rep: RepresentationData) -> np.ndarray:
+        """Extract flat feature vector from representation."""
+        if len(rep.representation.shape) == 3:
+            return np.mean(rep.representation, axis=(0, 1))
+        elif len(rep.representation.shape) == 2:
+            return np.mean(rep.representation, axis=0)
+        else:
+            return rep.representation.flatten()
+
+    def calculate_trajectory(self, layer_name: str) -> Dict[str, List[np.ndarray]]:
+        """Calculate representation trajectory for each conversation."""
+        if layer_name not in self.layer_data:
+            return {}
+            
+        conversations = {}
+        for rep in self.layer_data[layer_name]:
+            if rep.conversation_id not in conversations:
+                conversations[rep.conversation_id] = {}
+            conversations[rep.conversation_id][rep.turn_number] = self._get_features(rep)
+            
+        trajectories = {}
+        for conv_id, turns in conversations.items():
+            # Sort by turn number and stack
+            sorted_turns = sorted(turns.items())
+            trajectory = np.stack([feat for _, feat in sorted_turns])
+            trajectories[conv_id] = trajectory
+            
+        return trajectories
+
+    def train_harmful_probe(self, layer_name: str) -> Tuple[LogisticRegression, float]:
+        """Train a probe on single-turn (or first-turn) data."""
+        if layer_name not in self.layer_data:
+            raise ValueError(f"No data for layer {layer_name}")
+            
+        features = []
+        labels = []
+        
+        for rep in self.layer_data[layer_name]:
+            # Use only first turns or single-turn data for defining the "concept"
+            # Logic: We want to define "harmful" as it appears initially, then track drift
+            if rep.turn_number == 1:
+                features.append(self._get_features(rep))
+                labels.append(1 if rep.is_harmful else 0)
+                
+        if len(set(labels)) < 2:
+            self.logger.warning(f"Insufficient class diversity for probe in {layer_name}")
+            return None, 0.0
+            
+        X = np.array(features)
+        y = np.array(labels)
+        
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        
+        probe = LogisticRegression(random_state=42, max_iter=1000)
+        probe.fit(X_train, y_train)
+        score = probe.score(X_test, y_test)
+        
+        return probe, score
+
+    def measure_drift(self, layer_name: str) -> Dict[str, Any]:
+        """Measure concept drift using the harmful probe."""
+        probe, accuracy = self.train_harmful_probe(layer_name)
+        if probe is None:
+            return {'error': 'Could not train probe'}
+            
+        trajectories = self.calculate_trajectory(layer_name)
+        drift_metrics = {}
+        
+        for conv_id, trajectory in trajectories.items():
+            # Get probe probability for each step in trajectory
+            probs = probe.predict_proba(trajectory)[:, 1] # Probability of "harmful"
+            
+            # Find metadata for this conversation
+            # Assuming all reps in a conversation have same category/strategy
+            meta_rep = next(r for r in self.layer_data[layer_name] if r.conversation_id == conv_id)
+            
+            drift_metrics[conv_id] = {
+                'harmful_prob_trajectory': probs.tolist(),
+                'category': meta_rep.category.value if meta_rep.category else None,
+                'strategy': meta_rep.strategy.value if meta_rep.strategy else None,
+                'is_successful_attack': meta_rep.success
+            }
+            
+        return {
+            'layer_name': layer_name,
+            'probe_accuracy': accuracy,
+            'drift_data': drift_metrics
+        }
+
+    def measure_cosine_drift(self, layer_name: str) -> Dict[str, Any]:
+        """Measure drift as cosine distance from initial position."""
+        trajectories = self.calculate_trajectory(layer_name)
+        cosine_metrics = {}
+        
+        for conv_id, trajectory in trajectories.items():
+            # Initial vector (turn 1)
+            initial_vec = trajectory[0]
+            initial_norm = np.linalg.norm(initial_vec)
+            
+            similarities = []
+            for step_vec in trajectory:
+                step_norm = np.linalg.norm(step_vec)
+                if initial_norm == 0 or step_norm == 0:
+                    sim = 0.0
+                else:
+                    sim = np.dot(initial_vec, step_vec) / (initial_norm * step_norm)
+                similarities.append(float(sim))
+                
+            # Find metadata safely
+            meta_reps = [r for r in self.layer_data[layer_name] if r.conversation_id == conv_id]
+            if not meta_reps:
+                continue
+            meta_rep = meta_reps[0]
+            
+            cosine_metrics[conv_id] = {
+                'cosine_trajectory': similarities,
+                'category': meta_rep.category.value if meta_rep.category else None,
+                'is_successful_attack': meta_rep.success
+            }
+            
+        return {'layer_name': layer_name, 'drift_data': cosine_metrics}
+
+
+class ConceptSeparabilityAnalysis:
+    """Analyze separability and orthogonality of harmful concepts."""
+    
+    def __init__(self, representations: List[RepresentationData]):
+        self.representations = representations
+        self.logger = logging.getLogger(__name__)
+        
+    def _get_features(self, rep: RepresentationData) -> np.ndarray:
+        if len(rep.representation.shape) == 3:
+            return np.mean(rep.representation, axis=(0, 1))
+        elif len(rep.representation.shape) == 2:
+            return np.mean(rep.representation, axis=0)
+        else:
+            return rep.representation.flatten()
+
+    def calculate_centroids(self, layer_name: str) -> Dict[str, np.ndarray]:
+        """Calculate centroid for each harmful category."""
+        category_vectors = {}
+        
+        for rep in self.representations:
+            if rep.layer_name != layer_name or not rep.category or not rep.is_harmful:
+                continue
+                
+            cat_name = rep.category.value
+            if cat_name not in category_vectors:
+                category_vectors[cat_name] = []
+            
+            category_vectors[cat_name].append(self._get_features(rep))
+            
+        centroids = {}
+        for cat, vectors in category_vectors.items():
+            centroids[cat] = np.mean(vectors, axis=0)
+            
+        return centroids
+        
+    def compute_orthogonality(self, layer_name: str) -> pd.DataFrame:
+        """Compute cosine similarity matrix between concept centroids."""
+        centroids = self.calculate_centroids(layer_name)
+        if not centroids:
+            return pd.DataFrame()
+            
+        cats = sorted(centroids.keys())
+        matrix = np.zeros((len(cats), len(cats)))
+        
+        for i, cat1 in enumerate(cats):
+            for j, cat2 in enumerate(cats):
+                v1 = centroids[cat1]
+                v2 = centroids[cat2]
+                
+                norm1 = np.linalg.norm(v1)
+                norm2 = np.linalg.norm(v2)
+                
+                if norm1 == 0 or norm2 == 0:
+                    sim = 0.0
+                else:
+                    sim = np.dot(v1, v2) / (norm1 * norm2)
+                matrix[i, j] = sim
+                
+        return pd.DataFrame(matrix, index=cats, columns=cats)
 
 
 def main():
