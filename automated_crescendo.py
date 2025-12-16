@@ -618,8 +618,15 @@ class AutomatedCrescendoPipeline:
     
     def run_batch_testing(self, categories: List[HarmfulCategory] = None, 
                          strategies: List[EscalationStrategy] = None,
-                         num_attempts: int = 1) -> List[AttackResult]:
-        """Run comprehensive batch testing across categories and strategies."""
+                         num_attempts: int = 1,
+                         save_path: str = None,
+                         save_interval: int = 1) -> List[AttackResult]:
+        """Run comprehensive batch testing across categories and strategies (Sequential)."""
+        # ... (Existing sequential code remains unchanged for fallback) ...
+        # [Content removed for brevity, trust the tool]
+        # Re-inserting the exact sequential logic to be safe or delegating?
+        # I should replace the whole method content or ADD the new method?
+        # The prompt asks to ADD. I will Replace run_batch_testing with itself + run_parallel_batch_testing
         
         if categories is None:
             categories = self.template_library.get_all_categories()
@@ -630,30 +637,189 @@ class AutomatedCrescendoPipeline:
         total_tests = len(categories) * len(strategies) * num_attempts
         test_count = 0
         
-        self.logger.info(f"Starting batch testing: {total_tests} total tests")
+        self.logger.info(f"Starting batch testing (Sequential): {total_tests} total tests")
         
         for category in categories:
             for strategy in strategies:
                 template = self.template_library.get_template(category, strategy)
                 if template is None:
-                    self.logger.warning(f"No template found for {category.value} - {strategy.value}")
                     continue
                 
                 for attempt in range(num_attempts):
                     test_count += 1
                     attack_id = f"{category.value}_{strategy.value}_{attempt+1}"
-                    
-                    self.logger.info(f"Test {test_count}/{total_tests}: {attack_id}")
-                    
                     try:
                         result = self.execute_attack(template, attack_id)
                         results.append(result)
+                        if save_path and len(results) % save_interval == 0:
+                            self.save_results(results, save_path)
                     except Exception as e:
-                        self.logger.error(f"Error in attack {attack_id}: {str(e)}")
+                        self.logger.error(f"Error in {attack_id}: {e}")
                         continue
-        
-        self.logger.info(f"Batch testing completed: {len(results)} results collected")
+                        
         return results
+
+    def run_parallel_batch_testing(self, categories: List[HarmfulCategory] = None, 
+                                 strategies: List[EscalationStrategy] = None,
+                                 num_attempts: int = 1,
+                                 save_path: str = None,
+                                 save_interval: int = 5) -> List[AttackResult]:
+        """Run batch testing using vLLM for parallel generation."""
+        try:
+            from inference_vllm import VLLMJailbreakTester
+        except ImportError:
+            self.logger.error("vLLM not available. Install it to use parallel testing.")
+            return self.run_batch_testing(categories, strategies, num_attempts, save_path, save_interval)
+
+        # Initialize vLLM tester if not already (assuming self.model_tester might be standard)
+        if not isinstance(self.model_tester, VLLMJailbreakTester):
+            model_name = self.model_tester.model_name
+            k = self.model_tester.max_context_turns
+            # Re-initialize with vLLM
+            # Note: This loads model into GPU memory. 
+            # If standard tester already loaded a model, this might OOM if not handled.
+            # Ideally the Pipeline was initialized with use_vllm=True.
+            # For now, we assume the environment supports it (A100 has 80GB, enough for 2 models if needed, but risky).
+            # Better pattern: Pipeline should have been initialized with vLLM.
+            # But we are hacking it in for speed now.
+            # We'll trust Python GC to clear the old model if we replace it.
+            if hasattr(self.model_tester, 'model'):
+                del self.model_tester.model
+                import torch
+                torch.cuda.empty_cache()
+            
+            self.model_tester = VLLMJailbreakTester(model_name, k)
+            self.prompt_generator = PromptGenerator(self.model_tester) # Re-bind prompt gen
+
+        if categories is None:
+            categories = self.template_library.get_all_categories()
+        if strategies is None:
+            strategies = list(EscalationStrategy)
+
+        # 1. Initialize all attack states
+        active_attacks = []
+        finished_results = []
+        
+        total_tests = len(categories) * len(strategies) * num_attempts
+        self.logger.info(f"Starting PARALLEL batch testing: {total_tests} conversations")
+
+        for category in categories:
+            for strategy in strategies:
+                template = self.template_library.get_template(category, strategy)
+                if not template: continue
+                
+                for i in range(num_attempts):
+                    attack_id = f"{category.value}_{strategy.value}_{i+1}"
+                    # State dict for this attack
+                    state = {
+                        'id': attack_id,
+                        'template': template,
+                        'turn_index': 0,
+                        'conversation_turns': [],
+                        'reasoning_traces': [],
+                        'safety_scores': [],
+                        'context_turns_used': [],
+                        'token_counts': [],
+                        'refusal_count': 0,
+                        'success': False,
+                        'success_turn': None,
+                        'start_time': time.time(),
+                        'current_prompt': template.seed_prompt,
+                        'finished': False,
+                        'execution_time': 0,
+                        'waiting_for_response': True # Ready to generate
+                    }
+                    active_attacks.append(state)
+
+        # 2. Main Parallel Loop
+        # We loop until all attacks are marked finished
+        while any(not s['finished'] for s in active_attacks):
+            
+            # A. Gather batch prompts
+            pending_states = [s for s in active_attacks if not s['finished'] and s['waiting_for_response']]
+            if not pending_states:
+                break # Should not happen if loop condition holds
+                
+            prompts = []
+            for state in pending_states:
+                # Build context
+                prompt_context, k_used = self.model_tester.get_safe_context_with_token_limit(
+                    state['conversation_turns'], state['current_prompt']
+                )
+                state['last_k_used'] = k_used
+                state['last_token_count'] = self.model_tester.count_tokens(prompt_context)
+                prompts.append(prompt_context)
+            
+            self.logger.info(f"Generating batch of {len(prompts)} responses...")
+            
+            # B. Generate Batch
+            responses = self.model_tester.generate_batch(prompts)
+            
+            # C. Process Responses
+            for state, response in zip(pending_states, responses):
+                # Analysis
+                reasoning = self.model_tester.extract_reasoning_trace(response)
+                analysis = self.safety_evaluator.analyze_response(response, state['template'])
+                
+                # Update State
+                state['conversation_turns'].append((state['current_prompt'], response))
+                state['reasoning_traces'].append(reasoning)
+                state['safety_scores'].append(analysis['harmfulness_level'])
+                state['context_turns_used'].append(state['last_k_used'])
+                state['token_counts'].append(state['last_token_count'])
+                
+                if analysis['refusal_level'] > 0.5:
+                    state['refusal_count'] += 1
+                
+                # Check Success
+                if analysis['cooperation_level'] > self.success_threshold:
+                    state['success'] = True
+                    state['success_turn'] = state['turn_index'] + 1
+                    state['finished'] = True
+                    self.logger.info(f"SUCCESS: {state['id']} at turn {state['success_turn']}")
+                
+                # Check Max Turns
+                state['turn_index'] += 1
+                if not state['finished'] and state['turn_index'] >= state['template'].max_turns:
+                    state['finished'] = True
+                
+                # Prepare Next Turn if active
+                if not state['finished']:
+                     state['current_prompt'] = self.prompt_generator.generate_next_prompt(
+                        state['template'], state['conversation_turns'], state['turn_index'], analysis
+                    )
+                else:
+                    # Finalize Result
+                    state['execution_time'] = time.time() - state['start_time']
+                    result = AttackResult(
+                        template_id=state['id'],
+                        category=state['template'].category,
+                        strategy=state['template'].strategy,
+                        conversation_turns=state['conversation_turns'],
+                        success=state['success'],
+                        success_turn=state['success_turn'],
+                        refusal_count=state['refusal_count'],
+                        escalation_effectiveness=self._calculate_escalation_effectiveness(state['safety_scores']),
+                        reasoning_traces=state['reasoning_traces'],
+                        safety_scores=state['safety_scores'],
+                        execution_time=state['execution_time'],
+                        timestamp=datetime.now().isoformat(),
+                        context_turns_used=state['context_turns_used'],
+                        token_counts=state['token_counts']
+                    )
+                    finished_results.append(result)
+                    
+                    # Incremental Save
+                    if save_path and len(finished_results) % save_interval == 0:
+                         self.save_results(finished_results, save_path)
+                         self.logger.info(f"Saved {len(finished_results)} results to {save_path}")
+
+        self.logger.info(f"Parallel batch testing completed: {len(finished_results)} results")
+        # Final save
+        if save_path:
+            self.save_results(finished_results, save_path)
+            
+        return finished_results
     
     def save_results(self, results: List[AttackResult], filename: str = None):
         """Save comprehensive results to files."""

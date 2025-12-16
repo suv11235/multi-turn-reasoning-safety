@@ -11,7 +11,8 @@ image = (
         "numpy",
         "pandas",
         "scikit-learn",
-        "h5py"
+        "h5py",
+        "vllm"
     )
 )
 
@@ -25,12 +26,16 @@ image = image.add_local_dir(
     ignore=[".venv", ".git", "__pycache__", "representations", "wandb"]
 )
 
+# Create a persistent volume for storing results
+volume = modal.Volume.from_name("drift-experiment-data", create_if_missing=True)
+
 # Create app with the fully configured image
 app = modal.App("phase2-drift-experiment", image=image)
 
 @app.function(
-    gpu="A10G",
-    timeout=1800  # 30 minutes
+    gpu="A100-80GB",
+    timeout=7200,  # 2 hours
+    volumes={"/data": volume}  # Mount volume at /data
 )
 def run_drift_experiment():
     import os
@@ -42,6 +47,9 @@ def run_drift_experiment():
     print("PHASE 2: Drift Analysis Experiment")
     print("=" * 60)
     
+    # Ensure volume directory exists
+    os.makedirs("/data", exist_ok=True)
+    
     # Step 1: Generate attacks with Gradual strategy
     print("\n[1/3] Generating Gradual Crescendo attacks...")
     from automated_crescendo import (
@@ -50,16 +58,26 @@ def run_drift_experiment():
         EscalationStrategy
     )
     
-    pipeline = AutomatedCrescendoPipeline(max_context_turns=3)
+    pipeline = AutomatedCrescendoPipeline(max_context_turns=6)
     
-    results = pipeline.run_batch_testing(
-        categories=[HarmfulCategory.VIOLENCE],
+    import datetime
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Run larger batch for data collection? 
+    # Keeping at 2 for verification, user can increase later.
+    # Run with PARALLEL execution (vLLM)
+    # Using larger batch for data collection
+    results = pipeline.run_parallel_batch_testing(
+        categories=[HarmfulCategory.VIOLENCE,
+        HarmfulCategory.DRUGS],
         strategies=[EscalationStrategy.GRADUAL],
-        num_attempts=2
+        num_attempts=50,
+        save_path=f"/data/gradual_attacks_{timestamp}.json",
+        save_interval=5
     )
     
-    # Save results
-    output_file = "gradual_attacks.json"
+    # Save results to VOLUME with versioning
+    output_file = f"/data/gradual_attacks_{timestamp}.json"
     pipeline.save_results(results, output_file)
     print(f"✓ Generated {len(results)} attacks, saved to {output_file}")
     
@@ -74,9 +92,11 @@ def run_drift_experiment():
     print("\n[2/3] Extracting representations from ALL attacks (successful + failed)...")
     from representation_extraction import RepresentationExtractor
     
+    # Save representations to VOLUME with versioning
+    rep_dir = f"/data/representations_gradual_{timestamp}"
     extractor = RepresentationExtractor(
         model_name="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
-        output_dir="representations_gradual"
+        output_dir=rep_dir
     )
     
     # Extract from all attacks (limit to 2 for speed)
@@ -96,7 +116,7 @@ def run_drift_experiment():
         )
         all_reps.extend(reps)
     
-    print(f"✓ Extracted {len(all_reps)} representation snapshots")
+    print(f"✓ Extracted {len(all_reps)} representation snapshots to {rep_dir}")
     
     # Step 3: Analyze drift
     print("\n[3/3] Analyzing drift patterns...")
@@ -136,6 +156,10 @@ def run_drift_experiment():
                     print(f"      Turn {turn}: {prob:.4f} harmful probability")
         elif 'error' in probe_metrics:
             print(f"    Warning: {probe_metrics['error']}")
+    
+    # Commit volume explicitly (auto-commits on exit, but good practice)
+    volume.commit()
+    print("\n✓ Results safely stored in 'drift-experiment-data' volume")
     
     print("\n" + "=" * 60)
     print("Experiment Complete!")

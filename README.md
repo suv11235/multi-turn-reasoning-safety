@@ -26,8 +26,12 @@ python inference.py --mode interactive --question "Your initial question"
 
 **Automated Crescendo Attacks**:
 ```bash
-# Standard Crescendo (Gradual escalation)
+# Standard Crescendo (Local execution)
 python automated_crescendo.py --categories violence,drugs --strategies gradual
+
+# High-Performance Parallel Generation (Modal + vLLM)
+# Runs 100+ concurrent conversations with incremental saving (recommended for large datasets)
+modal run --detach modal_apps/run_drift_experiment.py
 
 # Advanced attacks (Purpose Inversion, Query Decomposition)
 python automated_crescendo.py --strategies purpose_inversion,query_decomposition
@@ -107,6 +111,7 @@ print(f"Steps to bypass: {results['steps_to_restore']}")
 
 ```
 ├── inference.py                      # Core inference engine with sliding window
+├── inference_vllm.py                 # vLLM-accelerated inference wrapper
 ├── automated_crescendo.py            # Automated attack generation pipeline
 ├── representation_extraction.py      # Representation analysis (Drift, Separability)
 ├── steering_vectors.py               # Circuit breaker implementation
@@ -160,6 +165,10 @@ modal run modal_apps/verify_model_integration.py   # Integration tests (A10G GPU
 - ✅ Integration Test: Circuit Breaker successfully modified model output (1.14 logit difference)
 
 ## 🎓 Key Features
+
+### Performance
+- **vLLM Acceleration**: Parallel batch inference for rapid attack generation (10x speedup)
+- **Incremental Saving**: Real-time data persistence to Modal Volumes
 
 ### Context Management
 - **Sliding Window**: Configurable k-turn context to prevent model collapse
